@@ -1,0 +1,131 @@
+apiVersion: sourceplane.io/v1
+kind: Component
+
+metadata:
+  name: web
+  description: The CRM — Marmelab's Atomic CRM single-page app as the Static Assets of a Cloudflare Worker whose own routes are the ported Supabase edge functions, per environment
+
+spec:
+  type: cloudflare-workers-assets-turbo
+  lifecycle: production
+  owner: platform
+  docs:
+    overview: docs/overview.md
+    pages:
+      - { path: docs/architecture.md, role: architecture, title: Architecture }
+      - { path: docs/runbook.md, role: runbook, title: Runbook }
+  domain: product
+  path: apps/web
+  lane: isolated
+  change:
+    inputs:
+      - pnpm-lock.yaml
+  # The Supabase project and its Hyperdrive config must exist, and the schema
+  # be applied, before the Worker that reads them deploys: enforced on a push
+  # to main, advisory on a pull request (which plans and verifies only).
+  dependsOn:
+    - component: supabase
+      mode: enforced
+      modeRules:
+        - mode: advisory
+          when:
+            triggerRef: github-pull-request
+    - component: cloudflare-hyperdrive
+      mode: enforced
+      modeRules:
+        - mode: advisory
+          when:
+            triggerRef: github-pull-request
+    - component: db-migrate
+      mode: enforced
+      modeRules:
+        - mode: advisory
+          when:
+            triggerRef: github-pull-request
+  # What the roots publish and the deploy reads — the wiring documents its
+  # config is rendered from, and the service-role key it stores as a Worker
+  # secret — resolved fail-closed as each job starts: a missing one fails the
+  # lane instead of deploying a Worker without it. Both environments' rungs,
+  # named, in every job: dev, which no root applies to, renders from the
+  # fixture and pushes nothing, and each deploy picks its own (`--env`).
+  secretEnv:
+    WIRING_SUPABASE_STAGE: "secret://atomic-crm/atomic-crm/stage/WIRING_SUPABASE"
+    WIRING_SUPABASE_PROD: "secret://atomic-crm/atomic-crm/prod/WIRING_SUPABASE"
+    WIRING_CLOUDFLARE_HYPERDRIVE_STAGE: "secret://atomic-crm/atomic-crm/stage/WIRING_CLOUDFLARE_HYPERDRIVE"
+    WIRING_CLOUDFLARE_HYPERDRIVE_PROD: "secret://atomic-crm/atomic-crm/prod/WIRING_CLOUDFLARE_HYPERDRIVE"
+    SUPABASE_SERVICE_ROLE_KEY_STAGE: "secret://atomic-crm/atomic-crm/stage/SUPABASE_SERVICE_ROLE_KEY"
+    SUPABASE_SERVICE_ROLE_KEY_PROD: "secret://atomic-crm/atomic-crm/prod/SUPABASE_SERVICE_ROLE_KEY"
+  # The optional services: stored on the Worker when they are set.
+  optionalSecretEnv:
+    POSTMARK_WEBHOOK_USER: "secret://atomic-crm/atomic-crm/{{ .environment }}/POSTMARK_WEBHOOK_USER"
+    POSTMARK_WEBHOOK_PASSWORD: "secret://atomic-crm/atomic-crm/{{ .environment }}/POSTMARK_WEBHOOK_PASSWORD"
+    POSTMARK_WEBHOOK_AUTHORIZED_IPS: "secret://atomic-crm/atomic-crm/{{ .environment }}/POSTMARK_WEBHOOK_AUTHORIZED_IPS"
+    # Postmark's inbound address: inlined into the build (the profile page
+    # shows it) and stored on the Worker (the postmark route reads it).
+    VITE_INBOUND_EMAIL: "secret://atomic-crm/atomic-crm/{{ .environment }}/VITE_INBOUND_EMAIL"
+  subscribe:
+    environments:
+      - name: dev
+        profile: verify
+      - name: stage
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+      - name: prod
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+  # How the site runs itself for orun.work's live Preview tab
+  # (saas-parallel-baselining PB4): `orun preview` starts this, and a coding
+  # session keeps it running while it works, so the person watches it change
+  # as it is built. The dev server binds the box's loopback only, on a fixed
+  # port, and installs first, so a checkout the session has not installed yet
+  # still comes up.
+  # --strictPort makes Vite fail rather than move to another port when 5173 is
+  # taken.
+  preview:
+    run:
+      - sh
+      - -c
+      - pnpm install --frozen-lockfile --prefer-offline --filter "@app/web..." && exec node_modules/.bin/vite --force --host 127.0.0.1 --port 5173 --strictPort
+    port: 5173
+    path: /
+    env:
+      NODE_OPTIONS: --max-old-space-size=512
+  parameters:
+    nodeVersion: "22"
+    pnpmVersion: "10.12.1"
+
+    workspaceDir: ../..
+    appDir: .
+
+    turboFilter: "@app/web"
+    wranglerConfig: wrangler.jsonc
+
+    # wrangler bundles the Worker from its source on deploy; the build is the
+    # single-page app.
+    workerEntrypoint: worker/index.ts
+    assetsDir: dist
+
+    workerName: atomic-crm-web
+    environmentAwareWorkerName: true
+
+    workersDevSubdomain: vijayakrishnan12994
+
+    installCommand: pnpm install --frozen-lockfile
+    # Render wrangler.jsonc for this environment (dev from the fixture), then
+    # build the app — which inlines the project's URL and publishable key from
+    # that render (vite.config.ts) — then hand the Worker its secrets.
+    buildCommand: node ../../tooling/wire/live.mjs --template wrangler.template.jsonc --out wrangler.jsonc --components supabase,cloudflare-hyperdrive --env "${ORUN_ENVIRONMENT}" --fixture wiring.fixture.json --fixture-envs dev && pnpm exec turbo run build --filter=@app/web && node ../../tooling/wire/worker-secrets.mjs --secret SUPABASE_SERVICE_ROLE_KEY --secret POSTMARK_WEBHOOK_USER --secret POSTMARK_WEBHOOK_PASSWORD --secret POSTMARK_WEBHOOK_AUTHORIZED_IPS --secret VITE_INBOUND_EMAIL --env "${ORUN_ENVIRONMENT}" --worker "atomic-crm-web-${ORUN_ENVIRONMENT}" --config wrangler.jsonc
+
+    smokeCommand: "html=$(curl -sfL \"${DEPLOYED_URL}/\") && echo \"${html}\" | grep -q '<div id=\"root\">' && health=$(curl -sf \"${DEPLOYED_URL}/api/health\") && echo \"${health}\" | grep -q '\"ok\":true' && test \"$(curl -s -o /dev/null -w '%{http_code}' -X PATCH \"${DEPLOYED_URL}/functions/v1/update_password\")\" = 401"
+  labels:
+    team: platform
+    layer: delivery
+    surface: web
+    runtime: cloudflare
+# orun: redeploy 01-product as_37269bf9ac29490a99ee
